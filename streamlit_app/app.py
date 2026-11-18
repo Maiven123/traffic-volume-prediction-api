@@ -1,7 +1,6 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time
-
 import plotly.graph_objects as go
 import requests
 import streamlit as st
