@@ -1,8 +1,9 @@
-import os
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time
+from pathlib import Path
+
+import joblib
+import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 
 st.set_page_config(page_title="Traffic Volume Predictor", layout="wide")
@@ -80,47 +81,51 @@ div[data-testid="stMetricLabel"] p { color: #9AA0A6; }
 st.markdown(STYLE, unsafe_allow_html=True)
 
 
-def default_api_url():
-    try:
-        return st.secrets["API_URL"]
-    except Exception:
-        return os.getenv("API_URL", "http://127.0.0.1:8000")
+MODEL_DIR = Path(__file__).resolve().parent.parent / "api"
 
 
-def call_predict(api_url, payload, timeout=90):
-    try:
-        response = requests.post(
-            f"{api_url.rstrip('/')}/predict", json=payload, timeout=timeout
-        )
-    except requests.exceptions.Timeout:
-        return None, "The server took too long to respond. Please try again in a moment."
-    except requests.exceptions.ConnectionError:
-        return None, (
-            "Could not reach the API. Check the API URL in the sidebar "
-            "and make sure the server is running."
-        )
-    except requests.exceptions.RequestException as exc:
-        return None, f"Unexpected network error: {exc}"
-
-    if response.status_code == 200:
-        return response.json(), None
-
-    try:
-        detail = response.json().get("detail")
-    except ValueError:
-        detail = response.text
-    return None, f"The API rejected the request (HTTP {response.status_code}): {detail}"
+@st.cache_resource(show_spinner=False)
+def load_artifacts():
+    model = joblib.load(MODEL_DIR / "Final_model.pkl")
+    artifacts = joblib.load(MODEL_DIR / "model_scaler.pkl")
+    model.n_jobs = 1
+    classes = list(getattr(artifacts.get("weather_encoder"), "classes_", []))
+    if not (classes and all(isinstance(c, str) for c in classes)):
+        classes = WEATHER_OPTIONS
+    return {
+        "model": model,
+        "scaler": artifacts.get("scaler"),
+        "columns": list(artifacts["feature_columns"]),
+        "holidays": {str(d) for d in artifacts.get("holiday_dates", [])},
+        "weather_codes": {name: index for index, name in enumerate(classes)},
+    }
 
 
-def fetch_profile(api_url, payload, chosen_date):
-    def one_hour(hour):
-        body = dict(payload)
-        body["date_time"] = datetime.combine(chosen_date, time(hour)).isoformat()
-        result, _ = call_predict(api_url, body, timeout=60)
-        return None if result is None else result["predicted_traffic_volume"]
+def build_row(bundle, moment, payload):
+    is_holiday = payload.get("is_holiday")
+    if is_holiday is None:
+        is_holiday = int(moment.date().isoformat() in bundle["holidays"])
+    return {
+        "temp": payload["temp"],
+        "rain_1h": payload["rain_1h"],
+        "snow_1h": payload["snow_1h"],
+        "clouds_all": payload["clouds_all"],
+        "weather_main": bundle["weather_codes"][payload["weather_main"]],
+        "hour": moment.hour,
+        "dayofweek": moment.weekday(),
+        "month": moment.month,
+        "is_weekend": int(moment.weekday() >= 5),
+        "is_holiday": int(is_holiday),
+    }
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        return list(pool.map(one_hour, range(24)))
+
+def predict_moments(bundle, moments, payload):
+    rows = [build_row(bundle, moment, payload) for moment in moments]
+    frame = pd.DataFrame(rows).reindex(columns=bundle["columns"])
+    if bundle["scaler"] is not None:
+        frame = pd.DataFrame(bundle["scaler"].transform(frame), columns=bundle["columns"])
+    predictions = bundle["model"].predict(frame)
+    return [max(0, round(float(value))) for value in predictions], rows
 
 
 def traffic_level(volume):
@@ -213,23 +218,6 @@ def build_profile_chart(profile, selected_hour):
     return fig
 
 
-with st.sidebar:
-    st.markdown("### API connection")
-    api_url = st.text_input("API URL", value=default_api_url())
-    if st.button("Test connection"):
-        try:
-            health = requests.get(f"{api_url.rstrip('/')}/health", timeout=90)
-            if health.status_code == 200:
-                st.success("The API is online and healthy.")
-            else:
-                st.error(f"The API answered with HTTP {health.status_code}.")
-        except requests.exceptions.RequestException:
-            st.error("Could not reach the API.")
-    st.caption(
-        "Free hosting may put the API to sleep after inactivity. "
-        "The first request can take up to a minute."
-    )
-
 st.markdown(
     """
     <div class="hero">
@@ -237,8 +225,8 @@ st.markdown(
         <h1 class="hero-title">Interstate <span>Traffic Volume</span> Predictor</h1>
         <p class="hero-sub">
             Estimate hourly vehicle flow on a major interstate from the time of day,
-            the calendar and the weather. Powered by a Random Forest model served
-            through a FastAPI service.
+            the calendar and the weather. Powered by a Random Forest model
+            trained on years of real traffic data.
         </p>
     </div>
     """,
@@ -274,7 +262,6 @@ with left:
     predict_clicked = st.button("Predict traffic volume", type="primary")
 
 payload = {
-    "date_time": datetime.combine(chosen_date, chosen_time).isoformat(),
     "temp": round(kelvin, 2),
     "rain_1h": float(rain),
     "snow_1h": float(snow),
@@ -293,23 +280,22 @@ with right:
     )
 
     if predict_clicked:
-        with st.spinner(
-            "Contacting the prediction service. The first request may take up to "
-            "a minute while the server wakes up."
-        ):
-            result, error = call_predict(api_url, payload)
-            profile = fetch_profile(api_url, payload, chosen_date) if result else None
-        if error:
-            st.session_state["error"] = error
-            st.session_state.pop("result", None)
-        else:
+        try:
+            with st.spinner("Running the model."):
+                bundle = load_artifacts()
+                selected = datetime.combine(chosen_date, chosen_time)
+                day = [datetime.combine(chosen_date, time(hour)) for hour in range(24)]
+                volumes, rows = predict_moments(bundle, [selected] + day, payload)
             st.session_state.pop("error", None)
             st.session_state["result"] = {
-                "volume": result["predicted_traffic_volume"],
-                "features": result["features_used"],
-                "profile": profile,
+                "volume": volumes[0],
+                "features": rows[0],
+                "profile": volumes[1:],
                 "hour": chosen_time.hour,
             }
+        except Exception as exc:
+            st.session_state["error"] = f"Prediction failed: {exc}"
+            st.session_state.pop("result", None)
 
     if "error" in st.session_state:
         st.error(st.session_state["error"])
@@ -381,6 +367,6 @@ for column, (title, body) in zip(st.columns(3, gap="large"), cards):
     )
 
 st.markdown(
-    '<div class="footer-note">Built with scikit-learn, FastAPI and Streamlit</div>',
+    '<div class="footer-note">Built with scikit-learn and Streamlit</div>',
     unsafe_allow_html=True,
 )

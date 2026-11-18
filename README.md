@@ -100,23 +100,26 @@ Invalid input returns HTTP 422 with a description of the problem.
 
 ## Web App
 
-A Streamlit interface in `streamlit_app/` sends the inputs to the API and displays the prediction, a traffic level gauge, and a 24-hour profile for the selected date.
+A Streamlit interface in `streamlit_app/` loads the trained model from the `api/` folder and displays the prediction, a traffic level gauge, and a 24-hour profile for the selected date.
 
 ```bash
-uvicorn main:app --reload --app-dir api
 pip install -r streamlit_app/requirements.txt
 streamlit run streamlit_app/app.py
 ```
 
-The app reads the API address from the `API_URL` environment variable or from a Streamlit secret named `API_URL`. It defaults to `http://127.0.0.1:8000`.
-
 ## Deployment
 
-The service runs on Render with:
+The web app is deployed on Streamlit Community Cloud:
 
-- Root directory: `api`
-- Build command: `pip install -r requirements.txt`
-- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-- Environment variable: `PYTHON_VERSION=3.12.8`
+- Repository: this repository, branch `main`
+- Main file path: `streamlit_app/app.py`
+- Python version: 3.12
 
-The scikit-learn version in `requirements.txt` must match the version used to train the model, because the model is stored as a pickle file.
+The FastAPI service in `api/` is independent of the web app and can be run locally or deployed separately:
+
+```bash
+pip install -r api/requirements.txt
+uvicorn main:app --reload --app-dir api
+```
+
+The scikit-learn version in the requirements files must match the version used to train the model, because the model is stored as a pickle file.
